@@ -1,0 +1,31 @@
+# Large or licensed assets — fetched per setup steps in README, not tracked.
+data/
+weights/
+
+# Training artifacts: keep only the small result files referenced by README.
+runs/**/ckpts/
+runs/**/tb/
+runs/**/*.log
+runs/**/val_epoch_*.json
+runs/**/infer_inputs/
+runs/**/infer_outputs/*_pred.png
+runs/**/infer_outputs/*_mask.png
+runs/**/infer_outputs/*_overlay.png
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Environments
+.venv/
+venv/
+env/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
