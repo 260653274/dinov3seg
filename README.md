@@ -67,9 +67,23 @@
 
 ## 🏗️ 网络架构
 
+### 双策略全景图
+
 ![DINOv3-PSPNet Variants for Semantic Segmentation](docs/3.png)
 
 📐 Baseline / Strategy A 与 Strategy B 的并排架构图(灰色为冻结、蓝色为可训练、紫色为 MSFA 多尺度融合、绿色为解码器)。
+
+### 总览流水线
+
+![Overall Mechanism of DINOv3 Segmentation Framework](docs/1.png)
+
+🔁 七阶段语义分割流水线:输入图像 → Patchify → 冻结 DINOv3 骨干 → 多层特征提取 → 特征对齐适配 → 轻量分割解码器 → 分割掩码。
+
+### 多尺度特征对齐细节(Strategy B)
+
+![Multi-Scale Feature Alignment Module](docs/2.png)
+
+🔗 MSFA 模块从某个 transformer block 取 token,反映射回 2D,然后用四种尺度处理(1/4 上采样、1/8 上采样、1/16 直通、1/28 下采样),拼接后送入解码器。
 
 🔧 MSFA 模块([models/adapter.py](models/adapter.py))让 ViT 早/中/末层都能贡献给解码器;辅助监督仍然落在第 6 层的融合前特征上。
 
@@ -111,7 +125,7 @@ scripts/
   └─ infer.py                         # 🎬 目录或单图推理
 
 存储目录
-  ├─ docs/                            # 🖼️  架构图(3.png 双策略全景图)
+  ├─ docs/                            # 🖼️  架构图(1.png 总览,2.png MSFA 细节,3.png 双策略全景图)
   ├─ weights/                         # 📦 dinov3_vits16_*.pth
   ├─ data/                            # 💾 VOCdevkit/(可选 VOCaug/)
   └─ runs/                            # 📤 输出(日志、ckpt、tb、eval json、infer png)
