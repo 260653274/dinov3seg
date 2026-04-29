@@ -18,7 +18,7 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -78,9 +78,19 @@ class DINOv3Backbone(nn.Module):
         weights_path: Optional[str] = None,
         aux_layer_idx: int = 6,
         freeze: bool = True,
+        freeze_until_block: Optional[int] = None,
         hub_repo: str = _HUB_REPO,
         hub_source: str = "github",  # kept for backward compat; unused
     ) -> None:
+        """
+        Args:
+            freeze: if True, fully freeze (no_grad forward, eval mode).
+            freeze_until_block: if `freeze=False` and this is set to k>0,
+                blocks 0..k-1 are frozen and blocks k..depth-1 are trainable
+                (Strategy A: unfreeze last few transformer blocks for fine-tuning).
+                Patch embed, pos_embed, register tokens, cls token are always frozen
+                in this mode. The final layer norm is left trainable.
+        """
         super().__init__()
         self.model_name = model_name
         self.aux_layer_idx = aux_layer_idx
@@ -93,19 +103,47 @@ class DINOv3Backbone(nn.Module):
         # Number of register tokens (DINOv3 uses 4 by default)
         self.num_register_tokens: int = getattr(self.model, "num_register_tokens", 4)
 
+        self._frozen: bool = False
+        self._freeze_until_block: int = 0
         if freeze:
             self.model.eval()
             for p in self.model.parameters():
                 p.requires_grad = False
             self._frozen = True
-        else:
-            self._frozen = False
+        elif freeze_until_block is not None and int(freeze_until_block) > 0:
+            self._apply_partial_freeze(int(freeze_until_block))
 
-    def train(self, mode: bool = True):  # noqa: D401 - keep frozen
+    def _apply_partial_freeze(self, freeze_until_block: int) -> None:
+        depth = self.depth
+        k = max(0, min(freeze_until_block, depth))
+        for name, p in self.model.named_parameters():
+            if name.startswith("blocks."):
+                block_idx = int(name.split(".")[1])
+                p.requires_grad = block_idx >= k
+            elif name.startswith("norm"):
+                p.requires_grad = True  # final layer norm — keep trainable
+            else:
+                # patch_embed / pos_embed / cls_token / register_tokens / mask_token / rope
+                p.requires_grad = False
+        self._freeze_until_block = k
+
+    def train(self, mode: bool = True):  # noqa: D401 - keep frozen parts in eval
         super().train(mode)
         if self._frozen:
             self.model.eval()
+        else:
+            self.model.train(mode)
         return self
+
+    @property
+    def is_fully_frozen(self) -> bool:
+        return self._frozen
+
+    @property
+    def depth(self) -> int:
+        if hasattr(self.model, "blocks"):
+            return len(self.model.blocks)
+        return 12  # ViT-S/16 default
 
     def _tokens_to_map(self, tokens: torch.Tensor, h: int, w: int) -> torch.Tensor:
         """tokens: (B, N, C) where N == h*w  ->  (B, C, h, w)."""
@@ -113,38 +151,32 @@ class DINOv3Backbone(nn.Module):
         assert n == h * w, f"token count {n} does not match grid {h}x{w}"
         return tokens.reshape(b, h, w, c).permute(0, 3, 1, 2).contiguous()
 
-    @torch.no_grad()
-    def _frozen_forward(self, x: torch.Tensor, return_aux: bool) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        return self._raw_forward(x, return_aux)
+    def _intermediate_maps(self, x: torch.Tensor, indices: Sequence[int]) -> List[torch.Tensor]:
+        """Return 2D feature maps from the requested transformer block indices.
 
-    def _raw_forward(self, x: torch.Tensor, return_aux: bool) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        All requested blocks get the final layernorm applied (norm=True), which
+        matches `forward_features`' final layer behavior. Indices are clamped
+        to [0, depth-1].
+        """
         H, W = x.shape[-2:]
         h = H // self.patch_size
         w = W // self.patch_size
+        depth = self.depth
+        clamped = [max(0, min(int(i), depth - 1)) for i in indices]
+        try:
+            outs = self.model.get_intermediate_layers(
+                x, n=list(clamped), reshape=False, norm=True
+            )
+        except TypeError:
+            # older DINOv3 signature without `norm` kwarg
+            outs = self.model.get_intermediate_layers(x, n=list(clamped))
+        return [self._tokens_to_map(t, h, w) for t in outs]
 
-        feat_main: torch.Tensor
-        feat_aux: Optional[torch.Tensor] = None
-
-        if return_aux and hasattr(self.model, "get_intermediate_layers"):
-            # Total Transformer depth
-            depth = len(self.model.blocks) if hasattr(self.model, "blocks") else 12
-            aux_idx = max(0, min(self.aux_layer_idx, depth - 1))
-            # Take aux block + last block; norm only the last one (matches forward_features)
-            try:
-                outs = self.model.get_intermediate_layers(
-                    x, n=[aux_idx, depth - 1], reshape=False, norm=True
-                )
-                aux_tokens, main_tokens = outs[0], outs[1]
-            except TypeError:
-                # Fallback: older signature without `norm` kwarg
-                outs = self.model.get_intermediate_layers(x, n=[aux_idx, depth - 1])
-                aux_tokens, main_tokens = outs[0], outs[1]
-
-            feat_main = self._tokens_to_map(main_tokens, h, w)
-            feat_aux = self._tokens_to_map(aux_tokens, h, w)
-            return feat_main, feat_aux
-
-        # Default path: use forward_features and select patch tokens
+    def _final_map(self, x: torch.Tensor) -> torch.Tensor:
+        """Final post-norm patch tokens via forward_features."""
+        H, W = x.shape[-2:]
+        h = H // self.patch_size
+        w = W // self.patch_size
         out = self.model.forward_features(x)
         if isinstance(out, dict) and "x_norm_patchtokens" in out:
             patch_tokens = out["x_norm_patchtokens"]
@@ -152,15 +184,44 @@ class DINOv3Backbone(nn.Module):
             # Fallback: assume layout [CLS, register_tokens..., patch_tokens]
             tokens = out if isinstance(out, torch.Tensor) else out["x"]
             patch_tokens = tokens[:, 1 + self.num_register_tokens :, :]
+        return self._tokens_to_map(patch_tokens, h, w)
 
-        feat_main = self._tokens_to_map(patch_tokens, h, w)
-        return feat_main, None
+    def forward(
+        self,
+        x: torch.Tensor,
+        return_aux: bool = False,
+        return_layers: Optional[Sequence[int]] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], List[torch.Tensor]]:
+        """
+        Three call modes:
 
-    def forward(self, x: torch.Tensor, return_aux: bool = False):
-        if self._frozen:
-            feat_main, feat_aux = self._frozen_forward(x, return_aux)
-        else:
-            feat_main, feat_aux = self._raw_forward(x, return_aux)
-        if return_aux:
-            return feat_main, feat_aux
-        return feat_main
+        - ``backbone(x)`` -> ``(B, C, h, w)`` final post-norm features.
+        - ``backbone(x, return_aux=True)`` -> ``(final, aux)`` for backward compatibility,
+          where ``aux`` is the ``aux_layer_idx``-th block's features.
+        - ``backbone(x, return_layers=[i, j, ...])`` -> list of 2D maps in the requested order.
+          Used by Strategy B (multi-layer feature alignment).
+
+        For full-freeze (``self._frozen=True``) the forward runs under ``torch.no_grad``
+        to save memory; for partial-freeze (Strategy A) the forward keeps its autograd
+        graph so gradients can flow back through the unfrozen tail.
+        """
+        # We only suppress grads when the entire backbone is frozen — otherwise
+        # autograd needs to retain activations for backprop through unfrozen blocks.
+        ctx = torch.no_grad() if self._frozen else _NullCtx()
+        with ctx:
+            if return_layers is not None:
+                return self._intermediate_maps(x, return_layers)
+
+            if return_aux:
+                depth = self.depth
+                indices = [self.aux_layer_idx, depth - 1]
+                feats = self._intermediate_maps(x, indices)
+                feat_aux, feat_main = feats[0], feats[1]
+                return feat_main, feat_aux
+
+            return self._final_map(x)
+
+
+class _NullCtx:
+    def __enter__(self): return self
+    def __exit__(self, *exc): return False

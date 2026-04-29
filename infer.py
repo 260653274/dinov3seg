@@ -33,6 +33,7 @@ def parse_args():
 
 def build_model(cfg, ckpt) -> DINOv3PSPNet:
     mcfg = cfg["model"]
+    msfa_cfg = mcfg.get("msfa", {}) or {}
     model = DINOv3PSPNet(
         num_classes=mcfg["num_classes"],
         backbone_name=mcfg["backbone"]["name"],
@@ -40,11 +41,17 @@ def build_model(cfg, ckpt) -> DINOv3PSPNet:
         embed_dim=mcfg["backbone"]["embed_dim"],
         aux_layer_idx=mcfg["backbone"].get("aux_layer_idx", 6),
         freeze_backbone=mcfg["backbone"].get("freeze", True),
+        backbone_freeze_until_block=mcfg["backbone"].get("freeze_until_block"),
         ppm_pool_sizes=tuple(mcfg["ppm"]["pool_sizes"]),
         ppm_reduction=mcfg["ppm"]["reduction_channels"],
         head_hidden=mcfg["head"]["hidden_channels"],
         head_dropout=mcfg["head"]["dropout"],
         use_aux=False,
+        msfa_enabled=bool(msfa_cfg.get("enabled", False)),
+        msfa_layers=tuple(msfa_cfg.get("layers", (3, 6, 9, 11))),
+        msfa_per_layer_channels=int(msfa_cfg.get("per_layer_channels", 96)),
+        msfa_out_channels=int(msfa_cfg.get("out_channels", mcfg["backbone"]["embed_dim"])),
+        msfa_upsample=bool(msfa_cfg.get("upsample", False)),
     )
     state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
     model.load_state_dict(state, strict=False)

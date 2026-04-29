@@ -1,0 +1,67 @@
+# DINOv3 + PSPNet on Pascal VOC 2012 — Strategy A
+# (Unfreeze last 2 transformer blocks of DINOv3 ViT-S/16 and fine-tune for 30 epochs,
+#  warm-starting from the frozen-baseline best.pth.)
+
+experiment:
+  name: dinov3_vits16_pspnet_voc_strategy_a
+  output_dir: runs/dinov3_vits16_pspnet_voc_strategy_a
+  seed: 42
+
+model:
+  backbone:
+    name: dinov3_vits16
+    weights_path: weights/dinov3_vits16_pretrain_lvd1689m-08c60483.pth
+    embed_dim: 384
+    aux_layer_idx: 6
+    freeze: false                 # Strategy A: NOT fully frozen
+    freeze_until_block: 10        # blocks 0..9 frozen, blocks 10..11 trainable (last 2 of 12)
+  msfa:
+    enabled: false                # baseline architecture (no MSFA)
+  ppm:
+    pool_sizes: [1, 2, 3, 6]
+    reduction_channels: 96
+  head:
+    hidden_channels: 256
+    dropout: 0.1
+  aux_head:
+    hidden_channels: 256
+    dropout: 0.1
+  num_classes: 21
+
+data:
+  root: data/VOCdevkit/VOC2012
+  use_sbd: false
+  sbd_root: data/VOCaug
+  ignore_index: 255
+  crop_size: 512
+  scale_range: [0.5, 2.0]
+  mean: [0.485, 0.456, 0.406]
+  std: [0.229, 0.224, 0.225]
+
+train:
+  init_from: runs/dinov3_vits16_pspnet_voc/ckpts/best.pth   # warm-start decoder from baseline
+  init_strict: false
+  batch_size: 8
+  num_workers: 4
+  epochs: 30                      # 30 more epochs of fine-tune
+  optimizer: adamw
+  lr: 1.0e-4                      # decoder LR = 1/10 of original 1e-3
+  backbone_lr_mult: 0.1           # backbone unfrozen tail LR = 1/100 of original (1e-5)
+  weight_decay: 1.0e-4
+  betas: [0.9, 0.999]
+  scheduler: poly
+  poly_power: 0.9
+  warmup_iters: 200               # short warmup since we start from a good init
+  warmup_ratio: 0.1
+  amp: true
+  aux_loss_weight: 0.4
+  log_interval: 20
+  ckpt_interval: 5
+  val_interval: 1
+  grad_clip: 1.0
+
+eval:
+  batch_size: 4
+  multi_scale: false
+  scales: [0.5, 0.75, 1.0, 1.25, 1.5]
+  flip: false

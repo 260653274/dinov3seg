@@ -42,6 +42,7 @@ def set_seed(seed: int) -> None:
 
 def build_model(cfg, use_aux: bool) -> DINOv3PSPNet:
     mcfg = cfg["model"]
+    msfa_cfg = mcfg.get("msfa", {}) or {}
     return DINOv3PSPNet(
         num_classes=mcfg["num_classes"],
         backbone_name=mcfg["backbone"]["name"],
@@ -49,6 +50,7 @@ def build_model(cfg, use_aux: bool) -> DINOv3PSPNet:
         embed_dim=mcfg["backbone"]["embed_dim"],
         aux_layer_idx=mcfg["backbone"].get("aux_layer_idx", 6),
         freeze_backbone=mcfg["backbone"].get("freeze", True),
+        backbone_freeze_until_block=mcfg["backbone"].get("freeze_until_block"),
         ppm_pool_sizes=tuple(mcfg["ppm"]["pool_sizes"]),
         ppm_reduction=mcfg["ppm"]["reduction_channels"],
         head_hidden=mcfg["head"]["hidden_channels"],
@@ -56,6 +58,11 @@ def build_model(cfg, use_aux: bool) -> DINOv3PSPNet:
         aux_hidden=mcfg["aux_head"]["hidden_channels"],
         aux_dropout=mcfg["aux_head"]["dropout"],
         use_aux=use_aux,
+        msfa_enabled=bool(msfa_cfg.get("enabled", False)),
+        msfa_layers=tuple(msfa_cfg.get("layers", (3, 6, 9, 11))),
+        msfa_per_layer_channels=int(msfa_cfg.get("per_layer_channels", 96)),
+        msfa_out_channels=int(msfa_cfg.get("out_channels", mcfg["backbone"]["embed_dim"])),
+        msfa_upsample=bool(msfa_cfg.get("upsample", False)),
     )
 
 
@@ -131,24 +138,52 @@ def main():
     model = build_model(cfg, use_aux=use_aux).to(device)
     train_loader, val_loader = build_loaders(cfg)
 
-    trainable = [p for p in model.parameters() if p.requires_grad]
-    total = sum(p.numel() for p in trainable)
-    print(f"Trainable parameters: {total/1e6:.2f}M")
+    # Optionally warm-start model weights from a previous checkpoint
+    # (Strategy A: continue from the frozen-baseline best.pth)
+    init_from = cfg["train"].get("init_from")
+    if init_from and os.path.isfile(init_from):
+        ck0 = torch.load(init_from, map_location="cpu")
+        state0 = ck0["model"] if isinstance(ck0, dict) and "model" in ck0 else ck0
+        missing, unexpected = model.load_state_dict(state0, strict=cfg["train"].get("init_strict", False))
+        print(f"[init_from] {init_from}")
+        print(f"  loaded missing={len(missing)} unexpected={len(unexpected)}")
+
+    # Split parameters into two groups: backbone (lower LR) and decoder (full LR).
+    backbone_lr_mult = float(cfg["train"].get("backbone_lr_mult", 1.0))
+    backbone_params, decoder_params = [], []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        (backbone_params if name.startswith("backbone.") else decoder_params).append(p)
+    n_back = sum(p.numel() for p in backbone_params)
+    n_dec  = sum(p.numel() for p in decoder_params)
+    print(f"Trainable parameters: backbone={n_back/1e6:.2f}M (lr_mult={backbone_lr_mult}) "
+          f"decoder={n_dec/1e6:.2f}M  total={(n_back+n_dec)/1e6:.2f}M")
 
     opt_cfg = cfg["train"]
+    base_lr = opt_cfg["lr"]
+    param_groups = []
+    if decoder_params:
+        param_groups.append({"params": decoder_params, "lr": base_lr,
+                             "name": "decoder"})
+    if backbone_params:
+        param_groups.append({"params": backbone_params, "lr": base_lr * backbone_lr_mult,
+                             "name": "backbone_unfrozen"})
+
     if opt_cfg["optimizer"].lower() == "adamw":
         optimizer = torch.optim.AdamW(
-            trainable, lr=opt_cfg["lr"],
+            param_groups, lr=base_lr,
             weight_decay=opt_cfg["weight_decay"],
             betas=tuple(opt_cfg.get("betas", (0.9, 0.999))),
         )
     elif opt_cfg["optimizer"].lower() == "sgd":
         optimizer = torch.optim.SGD(
-            trainable, lr=opt_cfg["lr"], momentum=0.9,
+            param_groups, lr=base_lr, momentum=0.9,
             weight_decay=opt_cfg["weight_decay"], nesterov=True,
         )
     else:
         raise ValueError(f"Unknown optimizer: {opt_cfg['optimizer']}")
+    trainable = backbone_params + decoder_params
 
     iters_per_epoch = len(train_loader)
     total_iters = iters_per_epoch * opt_cfg["epochs"]
