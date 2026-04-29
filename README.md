@@ -71,62 +71,6 @@
 
 📐 Baseline / Strategy A 与 Strategy B 的并排架构图(灰色为冻结、蓝色为可训练、紫色为 MSFA 多尺度融合、绿色为解码器)。
 
-### Baseline / Strategy A
-
-```
-            input image (B, 3, H, W),  H,W multiples of 16
-                            │
-              ┌─────────────▼────────────────────┐
-              │  DINOv3 ViT-S/16                 │  21 M params
-              │  Strategy A: blocks 10-11 解冻   │  (默认完全冻结;
-              │  其余始终冻结                    │   Strategy A 解冻
-              │  patch tokens, embed=384         │   末 2 块 + final norm)
-              └──────┬──────────────────┬────────┘
-            block 6 │                   │ final
-       (B,384,h,w) │                   ▼ (B,384,h,w),  h=H/16, w=W/16
-                    │            ┌──────────────┐
-                    │            │  PPM         │  pyramid pool 1×1, 2×2, 3×3, 6×6
-                    │            │  + 1×1 conv  │  reduce each branch to 96 ch
-                    │            │  + upsample  │  concat with input → (B,768,h,w)
-                    │            └──────┬───────┘
-                    │                   ▼
-                    │            ┌──────────────┐
-                    │            │ Conv 3×3 256 │
-                    │            │ BN, ReLU     │       2.81 M trainable
-                    │            │ Dropout 0.1  │
-                    │            │ Conv 1×1 21  │
-                    │            └──────┬───────┘
-                    │                   │ logits (B,21,h,w)
-                    │                   ▼
-                    │         bilinear ↑16  →  (B,21,H,W) ── main loss (CE, ignore=255)
-                    ▼
-              ┌──────────────┐
-              │ Aux head     │  Conv3×3 → BN → ReLU → Drop → Conv1×1
-              │ (train-only) │  upsample to (B,21,H,W)  ── aux loss × 0.4
-              └──────────────┘
-```
-
-### Strategy B —— Multi-Scale Feature Alignment (MSFA)
-
-```
-              ┌──────────────────────────────────┐
-              │  DINOv3 ViT-S/16  (frozen)       │
-              └──┬────────┬────────┬────────┬────┘
-               block 3  block 6  block 9  block 11
-                 │        │        │        │
-              ┌──▼──┐  ┌──▼──┐  ┌──▼──┐  ┌──▼──┐    each: 1×1 conv 384 → 96
-              │ 1×1 │  │ 1×1 │  │ 1×1 │  │ 1×1 │           BN, ReLU
-              └──┬──┘  └──┬──┘  └──┬──┘  └──┬──┘
-                 └────────┴────────┴────────┘
-                              │ concat → (B, 384, h, w)
-                              ▼
-                  ┌─────────────────────┐
-                  │ 3×3 conv → BN → ReLU│   the "fuse" step
-                  └──────────┬──────────┘
-                             ▼
-                          PPM + head  (same as baseline)
-```
-
 🔧 MSFA 模块([models/adapter.py](models/adapter.py))让 ViT 早/中/末层都能贡献给解码器;辅助监督仍然落在第 6 层的融合前特征上。
 
 🔒 **冻结骨干网络**意味着骨干网络始终处于 `eval()` 模式,从不接收梯度;仅 PPM、分割头、辅助头(及 Strategy A 中末 2 个 ViT block)进行参数更新。
