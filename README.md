@@ -67,8 +67,9 @@
 
 ## 🏗️ 网络架构
 
-![Framework Overview](docs/1.png)
-![MSFA Module](docs/2.png)
+![DINOv3-PSPNet Variants for Semantic Segmentation](docs/3.png)
+
+📐 Baseline / Strategy A 与 Strategy B 的并排架构图(灰色为冻结、蓝色为可训练、紫色为 MSFA 多尺度融合、绿色为解码器)。
 
 ### Baseline / Strategy A
 
@@ -166,7 +167,7 @@ scripts/
   └─ infer.py                         # 🎬 目录或单图推理
 
 存储目录
-  ├─ docs/                            # 🖼️  架构图(1.png 总览,2.png MSFA 细节)
+  ├─ docs/                            # 🖼️  架构图(3.png 双策略全景图)
   ├─ weights/                         # 📦 dinov3_vits16_*.pth
   ├─ data/                            # 💾 VOCdevkit/(可选 VOCaug/)
   └─ runs/                            # 📤 输出(日志、ckpt、tb、eval json、infer png)
